@@ -1,0 +1,426 @@
+/***********************
+ * НАСТРОЙКИ
+ ***********************/
+const SHEET_NAME     = 'Parcer Gebrauchte';
+
+// Главная лента "Latest Ads"
+const BASE_URL       = 'https://used-stage-equipment.com';
+const LIST_BASE_URL  = BASE_URL;
+
+const TIMEZONE       = 'Europe/Amsterdam';
+const ROOT_FOLDER_ID = '1Fq92Xe9SkQfsA2wZDaEord3rmD29Vpfp';
+const MAX_PAGES      = 10; // максимум страниц, которые обходим
+
+/***********************
+ * ЧАСТЬ 1. ПАРСЕР ОБЪЯВЛЕНИЙ ЗА ВЧЕРА
+ ***********************/
+
+/**
+ * Основная функция: парсит объявления за вчера и добавляет строки в лист.
+ */
+function dailyParseYesterdayAds() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  ensureHeader_(sheet);
+
+  const targetDate = getYesterdayDateOnly_(); // дата "вчера" (00:00)
+  const results = [];
+
+  let page = 1;
+  let stop = false;
+
+  while (!stop && page <= MAX_PAGES) {
+    const html = fetchListPage_(page);
+    const ads  = parseListPage_(html);
+
+    Logger.log('Страница %s: найдено объявлений %s', page, ads.length);
+
+    if (!ads.length) break;
+
+    for (let i = 0; i < ads.length; i++) {
+      const ad = ads[i];
+
+      // тянем дату конкретного объявления
+      const meta = fetchAdDate_(ad.fullUrl);
+      if (!meta.dateOnly) {
+        continue; // не смогли распарсить дату
+      }
+
+      // чуть-чуть логов для контроля (только первые несколько)
+      if (page === 1 && i < 3) {
+        Logger.log('Объявление: %s | дата: %s', ad.fullUrl, meta.dateStr);
+      }
+
+      if (isSameDate_(meta.dateOnly, targetDate)) {
+        results.push([
+          meta.dateStr || '',                                    // A: Дата объявления с временем
+          Utilities.formatDate(new Date(), TIMEZONE, 'dd.MM.yyyy HH:mm'), // B: Дата парсинга
+          ad.title,                                              // C: Название
+          ad.priceText,                                          // D: Цена
+          ad.fullUrl,                                            // E: Ссылка
+          'Скачать'                                              // F: подсказка для кнопки
+        ]);
+      } else if (meta.dateOnly < targetDate) {
+        // Лента отсортирована по новизне.
+        // Как только пошли даты старше "вчера" — дальше можно не смотреть.
+        stop = true;
+        break;
+      } else {
+        // meta.dateOnly > targetDate → это "сегодня" → просто пропускаем
+      }
+    }
+
+    page++;
+  }
+
+  Logger.log('Всего строк к записи: %s', results.length);
+
+  if (results.length) {
+    sheet
+      .getRange(sheet.getLastRow() + 1, 1, results.length, 6)
+      .setValues(results);
+  }
+}
+
+/**
+ * Создаём/проверяем заголовок в первой строке листа.
+ */
+function ensureHeader_(sheet) {
+  const header = [
+    'Дата',           // A
+    'Дата парсинга',  // B
+    'Название',       // C
+    'Цена',           // D
+    'Ссылка',         // E
+    'Скачать фото'    // F
+  ];
+
+  const range = sheet.getRange(1, 1, 1, header.length);
+  const values = range.getValues()[0];
+
+  const isSame =
+    values.length >= header.length &&
+    header.every(function (val, i) { return values[i] === val; });
+
+  if (!isSame) {
+    range.setValues([header]);
+  }
+}
+
+/**
+ * Возвращает дату "вчера" с обнулённым временем.
+ */
+function getYesterdayDateOnly_() {
+  const now = new Date();
+  const tzString = Utilities.formatDate(
+    now,
+    TIMEZONE,
+    "yyyy-MM-dd'T'HH:mm:ss"
+  );
+  const tzDate = new Date(tzString);
+  tzDate.setDate(tzDate.getDate() - 1);
+  tzDate.setHours(0, 0, 0, 0);
+  return tzDate;
+}
+
+/**
+ * Сравнение дат по дню/месяцу/году (без времени).
+ */
+function isSameDate_(d1, d2) {
+  return d1.getFullYear() === d2.getFullYear() &&
+         d1.getMonth()    === d2.getMonth() &&
+         d1.getDate()     === d2.getDate();
+}
+
+/**
+ * Формирует URL страницы списка по номеру страницы.
+ * page=1 → LIST_BASE_URL
+ * page>1 → LIST_BASE_URL + ?page=N
+ */
+function makeListUrl_(page) {
+  if (page === 1) {
+    return LIST_BASE_URL;
+  }
+  return LIST_BASE_URL + '?page=' + page;
+}
+
+/**
+ * Получает HTML страницы списка объявлений.
+ */
+function fetchListPage_(page) {
+  const url = makeListUrl_(page);
+  Logger.log('Загружаем страницу: %s', url);
+  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  return resp.getContentText('UTF-8');
+}
+
+/**
+ * Парсинг списка объявлений из HTML страницы.
+ * Вытаскиваем:
+ *  - URL объявления (fullUrl)
+ *  - название (title)
+ *  - цену (priceText)
+ * На этой странице даты НЕТ, поэтому за ней идём отдельно.
+ */
+function parseListPage_(html) {
+  const ads = [];
+
+  // Ссылки вида ...ad-123456...
+  const adLinkRegex = new RegExp(
+    '<a[^>]+href="([^"]*ad-[^"]+)"[^>]*>([\\s\\S]*?)<\\/a>',
+    'g'
+  );
+
+  let match;
+
+  while ((match = adLinkRegex.exec(html)) !== null) {
+    const hrefVal  = match[1];      // "ad-...", "/ad-...", "https://.../ad-..."
+    const rawTitle = match[2];
+    const title    = cleanHtml_(rawTitle).trim();
+    if (!title) continue;
+
+    // Берём небольшой контекст вокруг ссылки, чтобы поймать цену
+    const idx = match.index;
+    const contextStart = Math.max(0, idx - 500);
+    const contextEnd   = Math.min(html.length, idx + 500);
+    const context      = html.slice(contextStart, contextEnd);
+
+    // Цена: "7 490€", "7 490,- €", "7 490€ VB", "7 490€ FP" и т.п.
+    let priceText = '';
+    const pm = context.match(/(\d[\d\s.,]*?(?:,-)?)\s*€\s*(?:VB|FP)?/);
+    if (pm) {
+      priceText = cleanHtml_(pm[0]).trim();
+    }
+
+    // Строим полный URL
+    let fullUrl;
+    if (hrefVal.startsWith('http')) {
+      fullUrl = hrefVal;
+    } else {
+      fullUrl = BASE_URL.replace(/\/$/, '') + '/' + hrefVal.replace(/^\//, '');
+    }
+
+    ads.push({
+      fullUrl: fullUrl,
+      title: title,
+      priceText: priceText
+    });
+  }
+
+  return ads;
+}
+
+/**
+ * Простая очистка HTML → текст.
+ */
+function cleanHtml_(text) {
+  return String(text || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Тянем дату объявления со страницы самого объявления.
+ * Ищем первую дату-время вида "dd.MM.yyyy HH:MM".
+ */
+function fetchAdDate_(url) {
+  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const html = resp.getContentText('UTF-8');
+
+  const m = html.match(/([0-9]{2}\.[0-9]{2}\.[0-9]{4}\s+[0-9]{2}:[0-9]{2})/);
+  if (!m) {
+    return { dateOnly: null, dateStr: '' };
+  }
+
+  const dateStr = m[1]; // "09.12.2025 14:03"
+  const parts = dateStr.split(/\s+/);   // ["09.12.2025","14:03"]
+  const dParts = parts[0].split('.');  // ["09","12","2025"]
+  const tParts = parts[1].split(':');  // ["14","03"]
+
+  const day   = Number(dParts[0]);
+  const month = Number(dParts[1]) - 1;
+  const year  = Number(dParts[2]);
+  const hour  = Number(tParts[0]);
+  const min   = Number(tParts[1]);
+
+  const dt = new Date(year, month, day, hour, min, 0, 0);
+  const dateOnly = new Date(dt.getTime());
+  dateOnly.setHours(0, 0, 0, 0);
+
+  return { dateOnly: dateOnly, dateStr: dateStr };
+}
+
+/***********************
+ * ЧАСТЬ 2. КНОПКА "СКАЧАТЬ ФОТО" И ПАПКИ НА ДИСКЕ
+ ***********************/
+
+/**
+ * onEdit: если в колонке F написали "Скачать" / "Скачать фото" — качаем картинки.
+ */
+function onEdit(e) {
+  const range = e.range;
+  const sheet = range.getSheet();
+  if (sheet.getName() !== SHEET_NAME) return;
+
+  const row = range.getRow();
+  const col = range.getColumn();
+
+  // Игнорируем заголовок и не F-колонку
+  if (row === 1 || col !== 6) return;
+
+  const newValue = (e.value || '').toString().trim().toLowerCase();
+  if (newValue !== 'скачать' && newValue !== 'скачать фото') return;
+
+  sheet.getRange(row, 6).setValue('Скачиваю...');
+
+  try {
+    const result = downloadPhotosForRow_(row);
+    sheet.getRange(row, 6).setValue('Скачано ' + result.downloaded + ' фото');
+  } catch (err) {
+    sheet.getRange(row, 6).setValue('Ошибка: ' + err.message);
+  }
+}
+
+/**
+ * Качает фото для строки (row) по дате, названию и ссылке.
+ * Раскладывает по папкам:
+ *  Фото объявлений / MM.YYYY / "DD.MM Название"
+ */
+function downloadPhotosForRow_(row) {
+  const ss    = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+
+  const dateVal = sheet.getRange(row, 1).getValue(); // A: дата объявления
+  const title   = sheet.getRange(row, 3).getValue(); // C: название
+  const adUrl   = sheet.getRange(row, 5).getValue(); // E: ссылка
+
+  if (!adUrl) {
+    throw new Error('Нет ссылки на объявление');
+  }
+
+  const adDate = normalizeDate_(dateVal);
+
+  // Папки на диске
+  const rootFolder  = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const monthFolder = getOrCreateMonthFolder_(rootFolder, adDate);
+  const adFolder    = getOrCreateAdFolder_(monthFolder, adDate, title);
+
+  const fullUrl = adUrl.toString();
+
+  const html      = UrlFetchApp.fetch(fullUrl, { muteHttpExceptions: true }).getContentText('UTF-8');
+  const imageUrls = extractImageUrlsFromAdHtml_(html, fullUrl);
+
+  let downloaded = 0;
+
+  imageUrls.forEach(function (imgUrl, index) {
+    const resp = UrlFetchApp.fetch(imgUrl, { muteHttpExceptions: true });
+    const code = resp.getResponseCode();
+    if (code < 200 || code >= 300) return;
+
+    const blob        = resp.getBlob();
+    const contentType = blob.getContentType() || 'image/jpeg';
+
+    let ext = 'jpg';
+    const mtch = contentType.match(/image\/([a-zA-Z0-9]+)/);
+    if (mtch) ext = mtch[1];
+
+    const safeTitle = sanitizeForFileName_(title);
+    const fileName  =
+      Utilities.formatDate(adDate, TIMEZONE, 'yyyyMMdd') +
+      '_' + (index + 1) + '_' + safeTitle + '.' + ext;
+
+    adFolder.createFile(blob).setName(fileName);
+    downloaded++;
+  });
+
+  return { downloaded: downloaded };
+}
+
+/**
+ * Нормализуем дату из ячейки (Date или строка 'dd.MM.yyyy' / 'dd.MM.yyyy HH:MM') → Date.
+ */
+function normalizeDate_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    const d = new Date(value.getTime());
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  const str = String(value).trim();
+
+  const m = str.match(/^([0-9]{2})\.([0-9]{2})\.([0-9]{4})(?:\s+[0-9]{2}:[0-9]{2})?$/);
+  if (!m) {
+    throw new Error('Непонятный формат даты: ' + str);
+  }
+
+  const day   = Number(m[1]);
+  const month = Number(m[2]) - 1;
+  const year  = Number(m[3]);
+
+  const d = new Date(year, month, day);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/**
+ * Папка MM.YYYY — например "12.2025".
+ */
+function getOrCreateMonthFolder_(rootFolder, date) {
+  const name = Utilities.formatDate(date, TIMEZONE, 'MM.yyyy');
+  const it = rootFolder.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return rootFolder.createFolder(name);
+}
+
+/**
+ * Папка объявления "DD.MM Название" внутри месяца.
+ */
+function getOrCreateAdFolder_(monthFolder, date, title) {
+  const dateStr   = Utilities.formatDate(date, TIMEZONE, 'dd.MM'); // 09.12
+  const safeTitle = sanitizeForFileName_(title);
+  const name      = dateStr + ' ' + safeTitle;
+
+  const it = monthFolder.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return monthFolder.createFolder(name);
+}
+
+/**
+ * Чистим название для имени файла/папки.
+ */
+function sanitizeForFileName_(str) {
+  return String(str || '')
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, 80);
+}
+
+/**
+ * Вытаскиваем URL картинок из HTML объявления (cdn.g-vt.de).
+ */
+function extractImageUrlsFromAdHtml_(html, baseUrl) {
+  const urls = [];
+
+  const regex = new RegExp(
+    '<img[^>]+src="([^"]*cdn\\.g-vt\\.de[^"]+)"[^>]*>',
+    'gi'
+  );
+
+  let match;
+
+  while ((match = regex.exec(html)) !== null) {
+    let url = match[1];
+
+    if (!url.startsWith('http')) {
+      const base = baseUrl.split('/ad-')[0];
+      url = base.replace(/\/$/, '') + '/' + url.replace(/^\//, '');
+    }
+
+    urls.push(url);
+  }
+
+  return Array.from(new Set(urls));
+}
