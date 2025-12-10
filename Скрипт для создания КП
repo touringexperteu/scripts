@@ -1,0 +1,161 @@
+const TEMPLATE_ID = '1kCiwYEUUNUzQ80GkBwqwv4DjGu7hyinslH8A9Kr0f4A'; 
+// например: '1AbCdEfGhIjKlMnOpQrStUvWxYz'
+
+const KP_FOLDER_ID = '1P8G4P81GKs48D2Tu0kMglU9Znci749_g'; 
+// можешь оставить пустым, или поставить ID папки для готовых КП
+// например: '1ZxcvBnMaSdfGhJkLQwertyUiOp'
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('КП')
+    .addItem('Создать КП из KP_Form', 'createKPFromForm')
+    .addToUi();
+}
+function formatInt(val) {
+  if (val === '' || val === null || typeof val === 'undefined') return '';
+  return String(Math.round(Number(val)));
+}
+
+function formatMoney(val) {
+  if (val === '' || val === null || typeof val === 'undefined') return '';
+  return String(Math.round(Number(val))); // без копеек, просто целое
+}
+function createKPFromForm() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('KP_Form');
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Лист KP_Form не найден');
+    return;
+  }
+
+  // 1. Шапка: дата и валюта
+  const dateCell = sheet.getRange('B1').getValue(); // =TODAY() в таблице
+  const currency = sheet.getRange('B2').getValue() || 'RUB';
+
+  const timeZone = Session.getScriptTimeZone();
+  const dateStr = Utilities.formatDate(
+    dateCell || new Date(),
+    timeZone,
+    'dd.MM.yyyy'
+  );
+
+  // 2. Читаем строки с позициями: с 7-й по 200-ю, колонки A..K
+  const startRow = 7;
+  const lastRow = 200;
+  const numCols = 11; // A..K
+  const range = sheet.getRange(startRow, 1, lastRow - startRow + 1, numCols);
+  const values = range.getValues();
+
+  const items = [];
+  let totalNetto = 0;
+  let totalVat = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+
+    const productId = row[1]; // B: product_id
+    const brand     = row[2]; // C
+    const model     = row[3]; // D
+    const descr     = row[4]; // E
+    const qty       = row[5]; // F
+    const price     = row[6]; // G (price per unit)
+    const sumNetto  = row[7]; // H (total sum)
+    const priceVat  = row[8]; // I (price per unit VAT)
+    const sumVat    = row[9]; // J (total sum VAT)
+  
+
+    // пропускаем пустые строки
+    if (!productId || !qty || !price) continue;
+
+    const index = items.length + 1;
+
+    items.push({
+      index,
+      brand,
+      model,
+      descr,
+      qty,
+      price,
+      sumNetto,
+      priceVat,
+      sumVat,
+      comment
+    });
+
+    if (sumNetto) totalNetto += Number(sumNetto);
+    if (sumVat)   totalVat   += Number(sumVat);
+  }
+
+  if (items.length === 0) {
+    SpreadsheetApp.getUi().alert('Нет позиций для КП (заполни строки на листе KP_Form).');
+    return;
+  }
+
+  // 3. Создаём копию шаблона КП
+  const templateFile = DriveApp.getFileById(TEMPLATE_ID);
+
+  let kpName = `КП_${dateStr}_${currency}`;
+  let newFile;
+  if (KP_FOLDER_ID) {
+    const folder = DriveApp.getFolderById(KP_FOLDER_ID);
+    newFile = templateFile.makeCopy(kpName, folder);
+  } else {
+    newFile = templateFile.makeCopy(kpName);
+  }
+
+  const doc = DocumentApp.openById(newFile.getId());
+  const body = doc.getBody();
+
+  // 4. Заменяем текстовые плейсхолдеры
+  body.replaceText('{{DATE}}', dateStr);
+  body.replaceText('{{CURRENCY}}', currency);
+  body.replaceText('{{TOTAL_NETTO}}', totalNetto.toFixed(2));
+  body.replaceText('{{TOTAL_VAT}}', totalVat.toFixed(2));
+
+  // 5. Вставляем таблицу позиций вместо {{ITEMS_TABLE}}
+  const found = body.findText('{{ITEMS_TABLE}}');
+  if (found) {
+    const element = found.getElement();
+    const paragraph = element.getParent().asParagraph();
+
+    // Заголовок таблицы
+    const tableData = [];
+    tableData.push([
+      '№',
+      'Бренд',
+      'Модель',
+      'Описание',
+      'Кол-во',
+      `Цена без НДС (${currency})`,
+      `Сумма без НДС (${currency})`,
+      `Цена с НДС (${currency})`,
+      `Сумма с НДС (${currency})`,
+      'Комментарий'
+    ]);
+
+    // Строки с данными
+    items.forEach(item => {
+      tableData.push([
+        item.index,
+        item.brand || '',
+        item.model || '',
+        item.descr || '',
+        item.qty,
+        item.price,
+        item.sumNetto,
+        item.priceVat,
+        item.sumVat,
+        item.comment || ''
+      ]);
+    });
+
+    // Очищаем абзац с {{ITEMS_TABLE}} и вставляем таблицу на его месте
+    const bodyIndex = body.getChildIndex(paragraph);
+    paragraph.clear();
+    body.insertTable(bodyIndex + 1, tableData);
+  }
+
+  doc.saveAndClose();
+
+  SpreadsheetApp.getUi().alert('КП создано: ' + newFile.getUrl());
+}
